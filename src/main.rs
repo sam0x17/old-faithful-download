@@ -185,10 +185,9 @@ impl Config {
             .context("START_EPOCH must be a valid u64")?
             .unwrap_or(0);
 
-        let bucket_name = env::var("BACKBLAZE_KEY_NAME")
+        let bucket_name = env::var("BACKBLAZE_BUCKET_NAME")
             .ok()
-            .or_else(|| env::var("BACKBLAZE_BUCKET").ok())
-            .or_else(|| env::var("BACKBLAZE_BUCKET_NAME").ok());
+            .or_else(|| env::var("BACKBLAZE_BUCKET").ok());
 
         let key_id = env::var("BACKBLAZE_KEY_ID")
             .context("BACKBLAZE_KEY_ID is required")?;
@@ -533,7 +532,7 @@ impl B2Client {
         }
 
         Err(anyhow!(
-            "BACKBLAZE_BUCKET (or BACKBLAZE_BUCKET_NAME or BACKBLAZE_KEY_NAME) is required when multiple buckets are allowed"
+            "BACKBLAZE_BUCKET_NAME (or BACKBLAZE_BUCKET) is required when multiple buckets are allowed"
         ))
     }
 
