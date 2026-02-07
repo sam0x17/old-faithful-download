@@ -2,9 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use data_encoding::BASE32_NOPAD;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::StatusCode;
-use ripget::{download_url, RipgetError};
+use ripget::{download_url_with_progress, ProgressReporter, RipgetError};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_cbor::Value as CborValue;
@@ -14,10 +15,12 @@ use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
@@ -79,12 +82,12 @@ async fn main() -> Result<()> {
         .resolve_bucket(config.bucket_name.as_deref())
         .await?;
 
-    println!(
+    progress.ui().println(format!(
         "Starting at epoch {}. Tip epoch {}. Bucket: {}",
         start_epoch,
         tip_epoch,
         bucket_name.clone().unwrap_or_else(|| bucket_id.clone())
-    );
+    ));
 
     let mut in_flight: VecDeque<UploadTask> = VecDeque::new();
     let mut epoch = start_epoch;
@@ -101,10 +104,10 @@ async fn main() -> Result<()> {
                 resource,
                 url,
             } => {
-                println!(
+                progress.ui().println(format!(
                     "Got 404 for {} (epoch {}, {}). Assuming tip; stopping.",
                     resource, missing_epoch, url
-                );
+                ));
                 break;
             }
             DownloadEpochOutcome::Ready(files) => {
@@ -125,7 +128,7 @@ async fn main() -> Result<()> {
         await_oldest_upload(&mut in_flight, &latest_path, &progress).await?;
     }
 
-    println!("All done.");
+    progress.ui().println("All done.");
     Ok(())
 }
 
@@ -220,8 +223,7 @@ struct ProgressInner {
     latest_uploaded_epoch: AtomicU64,
     start_epoch: u64,
     tip_epoch: u64,
-    total_bytes: u64,
-    start_instant: Instant,
+    ui: ProgressUi,
 }
 
 impl Progress {
@@ -234,8 +236,7 @@ impl Progress {
                 latest_uploaded_epoch: AtomicU64::new(u64::MAX),
                 start_epoch,
                 tip_epoch,
-                total_bytes,
-                start_instant: Instant::now(),
+                ui: ProgressUi::new(total_bytes),
             }),
         }
     }
@@ -245,7 +246,8 @@ impl Progress {
     }
 
     fn add_upload(&self, bytes: u64) {
-        self.inner.uploaded.fetch_add(bytes, Ordering::Relaxed);
+        let new = self.inner.uploaded.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.inner.ui.overall().set_position(new);
     }
 
     fn mark_downloaded_epoch(&self, epoch: u64) {
@@ -290,32 +292,144 @@ impl Progress {
         }
     }
 
-    fn eta_bytes(&self, uploaded_bytes: u64, total_estimated: u64) -> Option<Duration> {
-        if uploaded_bytes == 0 || total_estimated == 0 {
-            return None;
-        }
-        let elapsed = self.inner.start_instant.elapsed().as_secs_f64();
-        if elapsed <= 0.0 {
-            return None;
-        }
-        let remaining = total_estimated.saturating_sub(uploaded_bytes) as f64;
-        if remaining <= 0.0 {
-            return Some(Duration::from_secs(0));
-        }
-        let bytes_per_sec = uploaded_bytes as f64 / elapsed;
-        if bytes_per_sec <= 0.0 {
-            return None;
-        }
-        let eta_seconds = remaining / bytes_per_sec;
-        Some(Duration::from_secs_f64(eta_seconds.max(0.0)))
-    }
-
     fn tip_epoch(&self) -> u64 {
         self.inner.tip_epoch
     }
 
-    fn total_bytes(&self) -> u64 {
-        self.inner.total_bytes
+
+    fn ui(&self) -> &ProgressUi {
+        &self.inner.ui
+    }
+}
+
+struct ProgressUi {
+    multi: MultiProgress,
+    overall: ProgressBar,
+}
+
+impl ProgressUi {
+    fn new(total_bytes: u64) -> Self {
+        let multi = MultiProgress::new();
+        multi.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
+
+        let overall = multi.add(ProgressBar::new(total_bytes));
+        overall.set_style(progress_style());
+        overall.set_prefix("overall");
+        overall.enable_steady_tick(Duration::from_millis(100));
+
+        Self { multi, overall }
+    }
+
+    fn overall(&self) -> &ProgressBar {
+        &self.overall
+    }
+
+    fn set_overall_message(&self, message: String) {
+        self.overall.set_message(message);
+    }
+
+    fn start_download(&self, label: &str) -> ProgressBar {
+        let bar = self.multi.add(ProgressBar::new(0));
+        bar.set_style(progress_style());
+        bar.set_prefix("download");
+        bar.set_message(label.to_string());
+        bar.enable_steady_tick(Duration::from_millis(100));
+        bar
+    }
+
+    fn start_upload(&self, label: &str, size: u64) -> ProgressBar {
+        let bar = self.multi.add(ProgressBar::new(size));
+        bar.set_style(progress_style());
+        bar.set_prefix("upload");
+        bar.set_message(label.to_string());
+        bar.enable_steady_tick(Duration::from_millis(100));
+        bar
+    }
+
+    fn finish_bar(&self, bar: &ProgressBar) {
+        bar.finish_and_clear();
+        let _ = self.multi.remove(bar);
+    }
+
+    fn println(&self, message: impl AsRef<str>) {
+        let _ = self.multi.println(message.as_ref());
+    }
+}
+
+struct UploadProgress {
+    bar: ProgressBar,
+    committed: AtomicU64,
+}
+
+impl UploadProgress {
+    fn new(bar: ProgressBar) -> Self {
+        Self {
+            bar,
+            committed: AtomicU64::new(0),
+        }
+    }
+
+    fn bar(&self) -> &ProgressBar {
+        &self.bar
+    }
+
+    fn reset_to_committed(&self) {
+        let committed = self.committed.load(Ordering::Relaxed);
+        self.bar.set_position(committed);
+    }
+
+    fn commit(&self, bytes: u64) {
+        let new = self.committed.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.bar.set_position(new);
+    }
+}
+
+struct ProgressReader<R> {
+    inner: R,
+    bar: ProgressBar,
+}
+
+impl<R> ProgressReader<R> {
+    fn new(inner: R, bar: ProgressBar) -> Self {
+        Self { inner, bar }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let after = buf.filled().len();
+            if after > before {
+                self.bar.inc((after - before) as u64);
+            }
+        }
+        poll
+    }
+}
+
+struct RipgetProgress {
+    bar: ProgressBar,
+}
+
+impl RipgetProgress {
+    fn new(bar: ProgressBar) -> Self {
+        Self { bar }
+    }
+}
+
+impl ProgressReporter for RipgetProgress {
+    fn init(&self, total: u64) {
+        self.bar.set_length(total);
+    }
+
+    fn add(&self, delta: u64) {
+        self.bar.inc(delta);
     }
 }
 
@@ -369,7 +483,15 @@ async fn download_epoch(
     let car_url = format!("{}/{}/{}", config.base_url, epoch, car_name);
     let car_path = bin_dir.join(&car_name);
 
-    match download_file(&car_url, &car_path, config.download_threads).await? {
+    match download_file(
+        &car_url,
+        &car_path,
+        config.download_threads,
+        progress.ui(),
+        &car_name,
+    )
+    .await?
+    {
         DownloadResult::NotFound => {
             return Ok(DownloadEpochOutcome::NotFound {
                 epoch,
@@ -392,7 +514,15 @@ async fn download_epoch(
     let slot_url = format!("{}/{}/{}", config.index_base_url, epoch, slot_name);
     let slot_path = bin_dir.join(&slot_name);
 
-    let _slot_bytes = match download_file(&slot_url, &slot_path, config.download_threads).await? {
+    let _slot_bytes = match download_file(
+        &slot_url,
+        &slot_path,
+        config.download_threads,
+        progress.ui(),
+        &slot_name,
+    )
+    .await?
+    {
         DownloadResult::NotFound => {
             cleanup_partial(&[&car_path, &slot_path]).await?;
             return Ok(DownloadEpochOutcome::NotFound {
@@ -411,7 +541,15 @@ async fn download_epoch(
     let cid_url = format!("{}/{}/{}", config.index_base_url, epoch, cid_name);
     let cid_path = bin_dir.join(&cid_name);
 
-    let _cid_bytes = match download_file(&cid_url, &cid_path, config.download_threads).await? {
+    let _cid_bytes = match download_file(
+        &cid_url,
+        &cid_path,
+        config.download_threads,
+        progress.ui(),
+        &cid_name,
+    )
+    .await?
+    {
         DownloadResult::NotFound => {
             cleanup_partial(&[&car_path, &slot_path, &cid_path]).await?;
             return Ok(DownloadEpochOutcome::NotFound {
@@ -438,8 +576,19 @@ async fn download_epoch(
     }))
 }
 
-async fn download_file(url: &str, dest: &Path, threads: usize) -> Result<DownloadResult> {
-    match download_url(url, dest, Some(threads), None).await {
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    threads: usize,
+    ui: &ProgressUi,
+    label: &str,
+) -> Result<DownloadResult> {
+    let bar = ui.start_download(label);
+    let reporter = Arc::new(RipgetProgress::new(bar.clone()));
+    let result = download_url_with_progress(url, dest, Some(threads), None, Some(reporter), None).await;
+    ui.finish_bar(&bar);
+
+    match result {
         Ok(report) => Ok(DownloadResult::Ok(report.bytes)),
         Err(RipgetError::HttpStatus { status, .. }) if status == StatusCode::NOT_FOUND => {
             Ok(DownloadResult::NotFound)
@@ -459,7 +608,9 @@ async fn upload_epoch(
     files: EpochFiles,
     progress: &Progress,
 ) -> Result<()> {
-    println!("Uploading epoch {}", files.epoch);
+    progress
+        .ui()
+        .println(format!("Uploading epoch {}", files.epoch));
     b2.upload_path(bucket_id, &files.car_remote, &files.car_path, progress)
         .await?;
     b2.upload_path(bucket_id, &files.slot_remote, &files.slot_path, progress)
@@ -560,13 +711,17 @@ impl B2Client {
             .with_context(|| format!("unable to stat {}", path.display()))?
             .len();
 
-        if size <= MAX_SMALL_FILE_BYTES {
-            self.upload_small_file(bucket_id, file_name, path, size, progress)
-                .await?;
+        let bar = progress.ui().start_upload(file_name, size);
+        let upload_progress = UploadProgress::new(bar.clone());
+        let result = if size <= MAX_SMALL_FILE_BYTES {
+            self.upload_small_file(bucket_id, file_name, path, size, progress, &upload_progress)
+                .await
         } else {
-            self.upload_large_file(bucket_id, file_name, path, size, progress)
-                .await?;
-        }
+            self.upload_large_file(bucket_id, file_name, path, size, progress, &upload_progress)
+                .await
+        };
+        progress.ui().finish_bar(&bar);
+        result?;
         Ok(())
     }
 
@@ -577,14 +732,17 @@ impl B2Client {
         path: &Path,
         size: u64,
         progress: &Progress,
+        upload_progress: &UploadProgress,
     ) -> Result<()> {
         let sha1 = sha1_hex(path).await?;
         let encoded_name = b2_encode_file_name(file_name);
 
         for attempt in 0..MAX_RETRIES {
+            upload_progress.reset_to_committed();
             let upload = self.get_upload_url(bucket_id).await?;
             let file = tokio::fs::File::open(path).await?;
-            let stream = ReaderStream::new(file);
+            let reader = ProgressReader::new(file, upload_progress.bar().clone());
+            let stream = ReaderStream::new(reader);
             let body = reqwest::Body::wrap_stream(stream);
             let response = self
                 .client
@@ -599,6 +757,7 @@ impl B2Client {
                 .await?;
 
             if response.status().is_success() {
+                upload_progress.commit(size);
                 progress.add_upload(size);
                 return Ok(());
             }
@@ -625,6 +784,7 @@ impl B2Client {
         path: &Path,
         size: u64,
         progress: &Progress,
+        upload_progress: &UploadProgress,
     ) -> Result<()> {
         let file_id = self.start_large_file(bucket_id, file_name).await?;
         let (part_size, part_count) = self.compute_part_size(size).await?;
@@ -647,10 +807,12 @@ impl B2Client {
 
             let mut uploaded = false;
             for attempt in 0..MAX_RETRIES {
+                upload_progress.reset_to_committed();
                 let upload = self.get_upload_part_url(&file_id).await?;
                 let mut file = tokio::fs::File::open(path).await?;
                 file.seek(SeekFrom::Start(offset)).await?;
-                let stream = ReaderStream::new(file.take(part_len));
+                let reader = ProgressReader::new(file.take(part_len), upload_progress.bar().clone());
+                let stream = ReaderStream::new(reader);
                 let body = reqwest::Body::wrap_stream(stream);
 
                 let response = self
@@ -665,6 +827,7 @@ impl B2Client {
                     .await?;
 
                 if response.status().is_success() {
+                    upload_progress.commit(part_len);
                     progress.add_upload(part_len);
                     uploaded = true;
                     break;
@@ -984,15 +1147,8 @@ fn log_progress(stage: &str, epoch: u64, progress: &Progress) {
     let (latest_downloaded, latest_uploaded) = progress.latest_epochs();
     let tip_epoch = progress.tip_epoch();
     let remaining_epochs = progress.remaining_epochs();
-    let total_bytes = progress.total_bytes();
-    let remaining_bytes = total_bytes.saturating_sub(uploaded);
-    let eta = progress
-        .eta_bytes(uploaded, total_bytes)
-        .map(format_duration)
-        .unwrap_or_else(|| "--".to_string());
-    println!(
-        "[{}] downloaded_epoch={} uploaded_epoch={} tip={} remaining_epochs={} downloaded={} ({}) uploaded={} ({}) total={} ({}) remaining={} ({}) eta={}",
-        stage,
+    let message = format!(
+        "dl_epoch={} ul_epoch={} tip={} remaining_epochs={} dl={} ul={}",
         latest_downloaded
             .map(|val| val.to_string())
             .unwrap_or_else(|| "-".to_string()),
@@ -1001,16 +1157,10 @@ fn log_progress(stage: &str, epoch: u64, progress: &Progress) {
             .unwrap_or_else(|| "-".to_string()),
         tip_epoch,
         remaining_epochs,
-        downloaded,
         format_bytes(downloaded),
-        uploaded,
         format_bytes(uploaded),
-        total_bytes,
-        format_bytes(total_bytes),
-        remaining_bytes,
-        format_bytes(remaining_bytes),
-        eta
     );
+    progress.ui().set_overall_message(message);
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1024,16 +1174,12 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.2} {}", size, units[idx])
 }
 
-fn format_duration(duration: Duration) -> String {
-    let total = duration.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{:02}h{:02}m{:02}s", hours, minutes, seconds)
-    } else {
-        format!("{:02}m{:02}s", minutes, seconds)
-    }
+fn progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:>8} {bar:40.cyan/blue} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta}) {msg}",
+    )
+    .expect("valid progress bar template")
+    .progress_chars("=>-")
 }
 
 fn trim_trailing_slash(mut value: String) -> String {

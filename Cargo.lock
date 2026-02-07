@@ -814,6 +814,7 @@ dependencies = [
  "base64",
  "data-encoding",
  "hex",
+ "indicatif",
  "reqwest",
  "ripget",
  "serde",
