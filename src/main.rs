@@ -27,7 +27,7 @@ use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 
 const DEFAULT_DOWNLOAD_THREADS: usize = 16;
-const LOOKAHEAD_LIMIT: usize = 3;
+const DEFAULT_CONCURRENT_UPLOADS: usize = 3;
 const DEFAULT_TIP_SCAN_THREADS: usize = 32;
 const DEFAULT_BASE_URL: &str = "https://files.old-faithful.net";
 const B2_AUTHORIZE_URL: &str = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
@@ -38,10 +38,6 @@ const B2_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if LOOKAHEAD_LIMIT == 0 {
-        return Err(anyhow!("LOOKAHEAD_LIMIT must be greater than 0"));
-    }
-
     let config = Config::from_env()?;
 
     let bin_dir = PathBuf::from("bin");
@@ -95,7 +91,7 @@ async fn main() -> Result<()> {
     let mut epoch = start_epoch;
 
     loop {
-        if in_flight.len() >= LOOKAHEAD_LIMIT {
+        if in_flight.len() >= config.concurrent_uploads {
             await_oldest_upload(&mut in_flight, &latest_path, &progress).await?;
         }
 
@@ -141,6 +137,7 @@ struct Config {
     network: String,
     download_threads: usize,
     tip_scan_threads: usize,
+    concurrent_uploads: usize,
     start_epoch: u64,
     bucket_name: Option<String>,
     key_id: String,
@@ -183,6 +180,17 @@ impl Config {
             return Err(anyhow!("TIP_SCAN_THREADS must be greater than 0"));
         }
 
+        let concurrent_uploads = env::var("CONCURRENT_UPLOADS")
+            .ok()
+            .map(|val| val.parse::<usize>())
+            .transpose()
+            .context("CONCURRENT_UPLOADS must be a valid usize")?
+            .unwrap_or(DEFAULT_CONCURRENT_UPLOADS);
+
+        if concurrent_uploads == 0 {
+            return Err(anyhow!("CONCURRENT_UPLOADS must be greater than 0"));
+        }
+
         let start_epoch = env::var("START_EPOCH")
             .ok()
             .map(|val| val.parse::<u64>())
@@ -205,6 +213,7 @@ impl Config {
             network,
             download_threads,
             tip_scan_threads,
+            concurrent_uploads,
             start_epoch,
             bucket_name,
             key_id,
