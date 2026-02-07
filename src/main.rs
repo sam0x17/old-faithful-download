@@ -1485,7 +1485,15 @@ async fn fetch_range(client: &reqwest::Client, url: &str, start: u64, end: u64) 
             return Err(anyhow!("404 for {}", url));
         }
         if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
-            return Ok(response.bytes().await?.to_vec());
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            return Ok(bytes.to_vec());
         }
         if should_retry_status(status) {
             sleep_with_backoff(attempt).await;
