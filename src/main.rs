@@ -3,28 +3,23 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bytes::Bytes;
 use data_encoding::BASE32_NOPAD;
-use futures_util::TryStreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, RANGE};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_cbor::Value as CborValue;
 use sha1::{Digest, Sha1};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tokio_util::io::StreamReader;
 
 const DEFAULT_NUM_THREADS: usize = 16;
 const DEFAULT_TIP_SCAN_THREADS: usize = 32;
@@ -43,10 +38,18 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&bin_dir).await?;
 
     let latest_path = bin_dir.join(".latest");
-    let start_epoch = match read_latest(&latest_path)? {
+    let progress_path = bin_dir.join("progress.toml");
+
+    let completed_epochs = read_progress(&progress_path)?;
+
+    let base_start = match read_latest(&latest_path)? {
         Some(latest) => latest.saturating_add(1),
         None => config.start_epoch,
     };
+    let mut start_epoch = base_start.max(config.start_epoch);
+    while completed_epochs.contains(&start_epoch) {
+        start_epoch = start_epoch.saturating_add(1);
+    }
 
     let tip_scan = scan_tip(
         &config.base_url,
@@ -71,6 +74,16 @@ async fn main() -> Result<()> {
 
     let progress = Progress::new(start_epoch, tip_epoch, tip_scan.total_bytes);
 
+    let completed_bytes = sum_completed_bytes(&tip_scan.epoch_sizes, &completed_epochs);
+    if completed_bytes > 0 {
+        let max_completed = completed_epochs.iter().copied().max();
+        progress.seed_completed(completed_bytes, max_completed);
+        progress.ui().println(format!(
+            "Resuming with {} bytes already uploaded.",
+            format_bytes(completed_bytes)
+        ));
+    }
+
     let b2 = Arc::new(B2Client::new(&config.key_id, &config.application_key).await?);
     let (bucket_id, bucket_name) = b2
         .resolve_bucket(config.bucket_name.as_deref())
@@ -84,7 +97,12 @@ async fn main() -> Result<()> {
         bucket_name.clone().unwrap_or_else(|| bucket_id.as_ref().clone())
     ));
 
-    let tracker = Arc::new(Mutex::new(CompletionTracker::new(start_epoch, latest_path)));
+    let tracker = Arc::new(Mutex::new(CompletionTracker::new(
+        base_start,
+        latest_path,
+        progress_path,
+        completed_epochs,
+    )?));
     let download_client = Arc::new(reqwest::Client::new());
 
     let mut join_set = JoinSet::new();
@@ -98,6 +116,17 @@ async fn main() -> Result<()> {
         {
             let epoch = next_epoch;
             next_epoch = next_epoch.saturating_add(1);
+
+            let already_completed = {
+                let guard = tracker.lock().await;
+                guard.is_completed(epoch)
+            };
+            if already_completed {
+                progress
+                    .ui()
+                    .println(format!("Skipping epoch {} (already uploaded).", epoch));
+                continue;
+            }
 
             let config = Arc::clone(&config);
             let b2 = Arc::clone(&b2);
@@ -249,6 +278,22 @@ impl Progress {
         }
     }
 
+    fn seed_completed(&self, bytes: u64, max_epoch: Option<u64>) {
+        self.inner.downloaded.store(bytes, Ordering::Relaxed);
+        self.inner.uploaded.store(bytes, Ordering::Relaxed);
+        self.inner.ui.download().set_position(bytes);
+        self.inner.ui.upload().set_position(bytes);
+        self.inner.ui.overall().set_position(bytes);
+        if let Some(epoch) = max_epoch {
+            self.inner
+                .latest_downloaded_epoch
+                .store(epoch, Ordering::Relaxed);
+            self.inner
+                .latest_uploaded_epoch
+                .store(epoch, Ordering::Relaxed);
+        }
+    }
+
     fn add_download(&self, bytes: u64) {
         let new = self.inner.downloaded.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.inner.ui.download().set_position(new);
@@ -367,53 +412,45 @@ impl ProgressUi {
     }
 }
 
-struct CountingReader<R> {
-    inner: R,
-    progress: Progress,
-}
-
-impl<R> CountingReader<R> {
-    fn new(inner: R, progress: Progress) -> Self {
-        Self { inner, progress }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let after = buf.filled().len();
-            if after > before {
-                self.progress.add_download((after - before) as u64);
-            }
-        }
-        poll
-    }
-}
-
 struct CompletionTracker {
     next_epoch: u64,
     completed: BTreeSet<u64>,
     latest_path: PathBuf,
+    progress_path: PathBuf,
 }
 
 impl CompletionTracker {
-    fn new(start_epoch: u64, latest_path: PathBuf) -> Self {
-        Self {
+    fn new(
+        start_epoch: u64,
+        latest_path: PathBuf,
+        progress_path: PathBuf,
+        completed: BTreeSet<u64>,
+    ) -> Result<Self> {
+        let mut tracker = Self {
             next_epoch: start_epoch,
-            completed: BTreeSet::new(),
+            completed,
             latest_path,
-        }
+            progress_path,
+        };
+        tracker.advance_latest()?;
+        Ok(tracker)
+    }
+
+    fn is_completed(&self, epoch: u64) -> bool {
+        self.completed.contains(&epoch)
     }
 
     fn mark_completed(&mut self, epoch: u64) -> Result<()> {
-        self.completed.insert(epoch);
-        while self.completed.remove(&self.next_epoch) {
+        if !self.completed.insert(epoch) {
+            return Ok(());
+        }
+        write_progress(&self.progress_path, &self.completed)?;
+        self.advance_latest()?;
+        Ok(())
+    }
+
+    fn advance_latest(&mut self) -> Result<()> {
+        while self.completed.contains(&self.next_epoch) {
             write_latest(&self.latest_path, self.next_epoch)?;
             self.next_epoch = self.next_epoch.saturating_add(1);
         }
@@ -550,74 +587,14 @@ async fn transfer_file(
     remote_name: &str,
     progress: &Progress,
 ) -> Result<TransferOutcome> {
-    let download = open_download_response(download_client, url).await?;
-    let (response, size) = match download {
-        DownloadOpenOutcome::NotFound => return Ok(TransferOutcome::NotFound),
-        DownloadOpenOutcome::Ok { response, size } => (response, size),
+    let size = match head_length(download_client, url).await? {
+        Some(len) => len,
+        None => return Ok(TransferOutcome::NotFound),
     };
 
-    let reader = response_to_reader(response, progress.clone());
-    b2.upload_large_stream(bucket_id, remote_name, size, reader, progress)
+    b2.upload_large_remote(download_client, bucket_id, remote_name, url, size, progress)
         .await?;
     Ok(TransferOutcome::Ok)
-}
-
-enum DownloadOpenOutcome {
-    Ok { response: reqwest::Response, size: u64 },
-    NotFound,
-}
-
-async fn open_download_response(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<DownloadOpenOutcome> {
-    let mut attempt = 0usize;
-    loop {
-        let response = client.get(url).send().await;
-        let response = match response {
-            Ok(resp) => resp,
-            Err(_) => {
-                sleep_with_backoff(attempt).await;
-                attempt = attempt.saturating_add(1);
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if status == StatusCode::NOT_FOUND {
-            return Ok(DownloadOpenOutcome::NotFound);
-        }
-        if status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT {
-            let length = response
-                .headers()
-                .get(CONTENT_LENGTH)
-                .ok_or_else(|| anyhow!("missing Content-Length for {}", url))?
-                .to_str()
-                .context("Content-Length was not valid UTF-8")?
-                .parse::<u64>()
-                .context("Content-Length was not a valid u64")?;
-            return Ok(DownloadOpenOutcome::Ok { response, size: length });
-        }
-
-        if should_retry_status(status) {
-            sleep_with_backoff(attempt).await;
-            attempt = attempt.saturating_add(1);
-            continue;
-        }
-
-        return Err(anyhow!("unexpected HTTP {} for {}", status, url));
-    }
-}
-
-fn response_to_reader(
-    response: reqwest::Response,
-    progress: Progress,
-) -> impl AsyncRead + Unpin {
-    let stream = response
-        .bytes_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
-    let reader = StreamReader::new(stream);
-    CountingReader::new(reader, progress)
 }
 
 struct B2Client {
@@ -700,24 +677,27 @@ impl B2Client {
         Ok(response.buckets)
     }
 
-    async fn upload_large_stream<R: AsyncRead + Unpin>(
+    async fn upload_large_remote(
         &self,
+        download_client: &reqwest::Client,
         bucket_id: &str,
         file_name: &str,
+        url: &str,
         size: u64,
-        mut reader: R,
         progress: &Progress,
     ) -> Result<()> {
         let file_id = self.start_large_file(bucket_id, file_name).await?;
         let (part_size, part_count) = self.compute_part_size(size).await?;
 
         let mut part_sha1s = Vec::with_capacity(part_count as usize);
-        let mut remaining = size;
 
         for part_index in 0..part_count {
             let part_number = (part_index + 1) as u32;
-            let part_len = std::cmp::min(part_size, remaining);
-            let part_bytes = read_part(&mut reader, part_len).await?;
+            let offset = part_index * part_size;
+            let part_len = std::cmp::min(part_size, size - offset);
+            let end = offset + part_len - 1;
+            let part_bytes =
+                fetch_range_with_progress(download_client, url, offset, end, progress).await?;
             let sha1 = sha1_hex_bytes(&part_bytes);
 
             let mut attempt = 0usize;
@@ -760,7 +740,6 @@ impl B2Client {
             }
 
             part_sha1s.push(sha1);
-            remaining = remaining.saturating_sub(part_len);
         }
 
         self.finish_large_file(&file_id, part_sha1s).await?;
@@ -1008,13 +987,6 @@ fn sha1_hex_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn read_part<R: AsyncRead + Unpin>(reader: &mut R, len: u64) -> Result<Bytes> {
-    let len_usize = usize::try_from(len).map_err(|_| anyhow!("part too large"))?;
-    let mut buffer = vec![0u8; len_usize];
-    reader.read_exact(&mut buffer).await?;
-    Ok(Bytes::from(buffer))
-}
-
 fn read_latest(path: &Path) -> Result<Option<u64>> {
     match fs::read_to_string(path) {
         Ok(contents) => {
@@ -1033,6 +1005,46 @@ fn read_latest(path: &Path) -> Result<Option<u64>> {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProgressFile {
+    epochs: Vec<u64>,
+}
+
+fn read_progress(path: &Path) -> Result<BTreeSet<u64>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                return Ok(BTreeSet::new());
+            }
+            let progress: ProgressFile = toml::from_str(&contents)
+                .context("progress.toml did not contain valid TOML")?;
+            Ok(progress.epochs.into_iter().collect())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn write_progress(path: &Path, epochs: &BTreeSet<u64>) -> Result<()> {
+    let progress = ProgressFile {
+        epochs: epochs.iter().copied().collect(),
+    };
+    let contents = toml::to_string_pretty(&progress)?;
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
+    Ok(())
+}
+
 fn write_latest(path: &Path, epoch: u64) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
     {
@@ -1047,6 +1059,14 @@ fn write_latest(path: &Path, epoch: u64) -> Result<()> {
         dir.sync_all()?;
     }
     Ok(())
+}
+
+fn sum_completed_bytes(sizes: &BTreeMap<u64, u64>, completed: &BTreeSet<u64>) -> u64 {
+    completed
+        .iter()
+        .filter_map(|epoch| sizes.get(epoch))
+        .copied()
+        .sum()
 }
 
 fn log_progress(epoch: u64, progress: &Progress) {
@@ -1119,6 +1139,7 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 struct TipScanResult {
     tip_epoch: u64,
     total_bytes: u64,
+    epoch_sizes: BTreeMap<u64, u64>,
 }
 
 enum HeadOutcome {
@@ -1230,15 +1251,18 @@ async fn scan_tip(
 
     let missing = missing_epoch.ok_or_else(|| anyhow!("tip scan did not encounter a 404"))?;
     let tip_epoch = missing.saturating_sub(1);
-    let total_bytes = sizes
-        .into_iter()
-        .filter(|(epoch, _)| *epoch <= tip_epoch)
-        .map(|(_, size)| size)
-        .sum();
+    let mut epoch_sizes = BTreeMap::new();
+    for (epoch, size) in sizes.into_iter() {
+        if epoch <= tip_epoch {
+            epoch_sizes.insert(epoch, size);
+        }
+    }
+    let total_bytes = epoch_sizes.values().copied().sum();
 
     Ok(TipScanResult {
         tip_epoch,
         total_bytes,
+        epoch_sizes,
     })
 }
 
@@ -1366,6 +1390,47 @@ async fn fetch_range(client: &reqwest::Client, url: &str, start: u64, end: u64) 
         }
         if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
             return Ok(response.bytes().await?.to_vec());
+        }
+        if should_retry_status(status) {
+            sleep_with_backoff(attempt).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+        return Err(anyhow!("unexpected HTTP {} for {}", status, url));
+    }
+}
+
+async fn fetch_range_with_progress(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    progress: &Progress,
+) -> Result<Bytes> {
+    let mut attempt = 0usize;
+    loop {
+        let response = client
+            .get(url)
+            .header(RANGE, format!("bytes={}-{}", start, end))
+            .send()
+            .await;
+        let response = match response {
+            Ok(resp) => resp,
+            Err(_) => {
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(anyhow!("404 for {}", url));
+        }
+        if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
+            let bytes = response.bytes().await?;
+            progress.add_download(bytes.len() as u64);
+            return Ok(bytes);
         }
         if should_retry_status(status) {
             sleep_with_backoff(attempt).await;
