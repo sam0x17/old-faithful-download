@@ -1267,24 +1267,28 @@ async fn scan_tip(
     let mut sizes: Vec<(u64, u64)> = Vec::new();
     let mut running_total = 0u64;
     let mut epochs_found = 0u64;
-
-    let spawn_epoch = |epoch: u64, join_set: &mut JoinSet<Result<HeadOutcome>>| {
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        let index_base_url = index_base_url.to_string();
-        let network = network.to_string();
-        join_set.spawn(async move {
-            head_epoch(&client, &base_url, &index_base_url, &network, epoch).await
-        });
-    };
+    let mut pending_epochs: BTreeSet<u64> = BTreeSet::new();
 
     while join_set.len() < threads {
-        spawn_epoch(next_epoch, &mut join_set);
+        spawn_head_task(
+            &mut join_set,
+            &mut pending_epochs,
+            &client,
+            base_url,
+            index_base_url,
+            network,
+            next_epoch,
+        );
         next_epoch = next_epoch.saturating_add(1);
     }
 
     while let Some(result) = join_set.join_next().await {
         let outcome = result.context("tip scan task panicked")??;
+        let epoch = match outcome {
+            HeadOutcome::Ok { epoch, .. } => epoch,
+            HeadOutcome::NotFound { epoch } => epoch,
+        };
+        pending_epochs.remove(&epoch);
         match outcome {
             HeadOutcome::Ok {
                 epoch,
@@ -1339,8 +1343,22 @@ async fn scan_tip(
             }
         }
 
+        if let Some(missing) = missing_epoch {
+            if pending_epochs.iter().all(|pending| *pending >= missing) {
+                break;
+            }
+        }
+
         if missing_epoch.is_none() {
-            spawn_epoch(next_epoch, &mut join_set);
+            spawn_head_task(
+                &mut join_set,
+                &mut pending_epochs,
+                &client,
+                base_url,
+                index_base_url,
+                network,
+                next_epoch,
+            );
             next_epoch = next_epoch.saturating_add(1);
         }
     }
@@ -1360,6 +1378,25 @@ async fn scan_tip(
         total_bytes,
         epoch_sizes,
     })
+}
+
+fn spawn_head_task(
+    join_set: &mut JoinSet<Result<HeadOutcome>>,
+    pending_epochs: &mut BTreeSet<u64>,
+    client: &reqwest::Client,
+    base_url: &str,
+    index_base_url: &str,
+    network: &str,
+    epoch: u64,
+) {
+    pending_epochs.insert(epoch);
+    let client = client.clone();
+    let base_url = base_url.to_string();
+    let index_base_url = index_base_url.to_string();
+    let network = network.to_string();
+    join_set.spawn(async move {
+        head_epoch(&client, &base_url, &index_base_url, &network, epoch).await
+    });
 }
 
 async fn head_epoch(
