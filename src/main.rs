@@ -23,6 +23,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 
 const DEFAULT_DOWNLOAD_THREADS: usize = 16;
@@ -32,7 +33,8 @@ const DEFAULT_BASE_URL: &str = "https://files.old-faithful.net";
 const B2_AUTHORIZE_URL: &str = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
 const MAX_SMALL_FILE_BYTES: u64 = 5_000_000_000;
 const MAX_PART_SIZE: u64 = 5_000_000_000;
-const MAX_RETRIES: usize = 3;
+const B2_RETRY_BASE_DELAY_MS: u64 = 1_000;
+const B2_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -737,7 +739,8 @@ impl B2Client {
         let sha1 = sha1_hex(path).await?;
         let encoded_name = b2_encode_file_name(file_name);
 
-        for attempt in 0..MAX_RETRIES {
+        let mut attempt = 0usize;
+        loop {
             upload_progress.reset_to_committed();
             let upload = self.get_upload_url(bucket_id).await?;
             let file = tokio::fs::File::open(path).await?;
@@ -754,7 +757,16 @@ impl B2Client {
                 .header(CONTENT_LENGTH, size.to_string())
                 .body(body)
                 .send()
-                .await?;
+                .await;
+
+            let response = match response {
+                Ok(resp) => resp,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
 
             if response.status().is_success() {
                 upload_progress.commit(size);
@@ -762,19 +774,14 @@ impl B2Client {
                 return Ok(());
             }
 
-            if response.status().is_server_error()
-                || response.status() == StatusCode::TOO_MANY_REQUESTS
-                || response.status() == StatusCode::UNAUTHORIZED
-            {
-                if attempt + 1 < MAX_RETRIES {
-                    continue;
-                }
+            if should_retry_status(response.status()) || response.status() == StatusCode::UNAUTHORIZED {
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
             }
 
             return Err(parse_b2_error(response).await);
         }
-
-        Err(anyhow!("failed to upload {} after retries", file_name))
     }
 
     async fn upload_large_file(
@@ -805,8 +812,8 @@ impl B2Client {
             let part_len = std::cmp::min(part_size, size - offset);
             let sha1 = sha1_hex_range(path, offset, part_len).await?;
 
-            let mut uploaded = false;
-            for attempt in 0..MAX_RETRIES {
+            let mut attempt = 0usize;
+            loop {
                 upload_progress.reset_to_committed();
                 let upload = self.get_upload_part_url(&file_id).await?;
                 let mut file = tokio::fs::File::open(path).await?;
@@ -824,33 +831,32 @@ impl B2Client {
                     .header(CONTENT_LENGTH, part_len.to_string())
                     .body(body)
                     .send()
-                    .await?;
+                    .await;
+
+                let response = match response {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        sleep_with_backoff(attempt).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                };
 
                 if response.status().is_success() {
                     upload_progress.commit(part_len);
                     progress.add_upload(part_len);
-                    uploaded = true;
                     break;
                 }
 
-                if response.status().is_server_error()
-                    || response.status() == StatusCode::TOO_MANY_REQUESTS
+                if should_retry_status(response.status())
                     || response.status() == StatusCode::UNAUTHORIZED
                 {
-                    if attempt + 1 < MAX_RETRIES {
-                        continue;
-                    }
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
                 }
 
                 return Err(parse_b2_error(response).await);
-            }
-
-            if !uploaded {
-                return Err(anyhow!(
-                    "failed to upload part {} of {}",
-                    part_number,
-                    file_name
-                ));
             }
             part_sha1s.push(sha1);
         }
@@ -918,7 +924,8 @@ impl B2Client {
         api_call: &str,
         body: serde_json::Value,
     ) -> Result<T> {
-        for attempt in 0..2 {
+        let mut attempt = 0usize;
+        loop {
             let state = self.state.lock().await.clone();
             let url = format!("{}/b2api/v4/{}", state.api_url, api_call);
             let response = self
@@ -927,46 +934,79 @@ impl B2Client {
                 .header(AUTHORIZATION, state.auth_token)
                 .json(&body)
                 .send()
-                .await?;
+                .await;
 
-            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
-                self.refresh_authorization().await?;
-                continue;
-            }
+            let response = match response {
+                Ok(resp) => resp,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
 
             if response.status().is_success() {
                 return Ok(response.json::<T>().await?);
             }
 
+            if response.status() == StatusCode::UNAUTHORIZED {
+                self.refresh_authorization().await?;
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+
+            if should_retry_status(response.status()) {
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+
             return Err(parse_b2_error(response).await);
         }
-
-        Err(anyhow!("B2 API call failed after reauthorization"))
     }
 }
 
 async fn authorize(client: &reqwest::Client, key_id: &str, application_key: &str) -> Result<B2State> {
     let auth = STANDARD.encode(format!("{}:{}", key_id, application_key));
-    let response = client
-        .get(B2_AUTHORIZE_URL)
-        .header(AUTHORIZATION, format!("Basic {}", auth))
-        .send()
-        .await?;
+    let mut attempt = 0usize;
+    loop {
+        let response = client
+            .get(B2_AUTHORIZE_URL)
+            .header(AUTHORIZATION, format!("Basic {}", auth))
+            .send()
+            .await;
 
-    if !response.status().is_success() {
+        let response = match response {
+            Ok(resp) => resp,
+            Err(_) => {
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        if response.status().is_success() {
+            let response: AuthorizeResponse = response.json().await?;
+            let storage = response.api_info.storage_api;
+            return Ok(B2State {
+                account_id: response.account_id,
+                api_url: storage.api_url,
+                auth_token: response.authorization_token,
+                recommended_part_size: storage.recommended_part_size,
+                absolute_min_part_size: storage.absolute_minimum_part_size,
+                allowed_buckets: storage.allowed.buckets,
+            });
+        }
+
+        if should_retry_status(response.status()) {
+            sleep_with_backoff(attempt).await;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+
         return Err(parse_b2_error(response).await);
     }
-
-    let response: AuthorizeResponse = response.json().await?;
-    let storage = response.api_info.storage_api;
-    Ok(B2State {
-        account_id: response.account_id,
-        api_url: storage.api_url,
-        auth_token: response.authorization_token,
-        recommended_part_size: storage.recommended_part_size,
-        absolute_min_part_size: storage.absolute_minimum_part_size,
-        allowed_buckets: storage.allowed.buckets,
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1180,6 +1220,19 @@ fn progress_style() -> ProgressStyle {
     )
     .expect("valid progress bar template")
     .progress_chars("=>-")
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+}
+
+async fn sleep_with_backoff(attempt: usize) {
+    let exp = 1u64 << attempt.min(16) as u32;
+    let delay = B2_RETRY_BASE_DELAY_MS.saturating_mul(exp);
+    let capped = delay.min(B2_RETRY_MAX_DELAY_MS);
+    sleep(Duration::from_millis(capped)).await;
 }
 
 fn trim_trailing_slash(mut value: String) -> String {
