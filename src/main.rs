@@ -895,7 +895,15 @@ impl B2Client {
             };
 
             if response.status().is_success() {
-                return Ok(response.json::<T>().await?);
+                let parsed = match response.json::<T>().await {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        sleep_with_backoff(attempt).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                };
+                return Ok(parsed);
             }
 
             if response.status() == StatusCode::UNAUTHORIZED {
@@ -936,7 +944,14 @@ async fn authorize(client: &reqwest::Client, key_id: &str, application_key: &str
         };
 
         if response.status().is_success() {
-            let response: AuthorizeResponse = response.json().await?;
+            let response: AuthorizeResponse = match response.json().await {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
             let storage = response.api_info.storage_api;
             return Ok(B2State {
                 account_id: response.account_id,
@@ -1569,7 +1584,14 @@ async fn fetch_range_with_progress(
             return Err(anyhow!("404 for {}", url));
         }
         if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::OK {
-            let bytes = response.bytes().await?;
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
             progress.add_download(bytes.len() as u64);
             return Ok(bytes);
         }
