@@ -592,8 +592,14 @@ async fn transfer_file(
         None => return Ok(TransferOutcome::NotFound),
     };
 
-    b2.upload_large_remote(download_client, bucket_id, remote_name, url, size, progress)
-        .await?;
+    let (_, part_count) = b2.compute_part_size(size).await?;
+    if part_count < 2 {
+        b2.upload_small_remote(download_client, bucket_id, remote_name, url, size, progress)
+            .await?;
+    } else {
+        b2.upload_large_remote(download_client, bucket_id, remote_name, url, size, progress)
+            .await?;
+    }
     Ok(TransferOutcome::Ok)
 }
 
@@ -746,6 +752,65 @@ impl B2Client {
         Ok(())
     }
 
+    async fn upload_small_remote(
+        &self,
+        download_client: &reqwest::Client,
+        bucket_id: &str,
+        file_name: &str,
+        url: &str,
+        size: u64,
+        progress: &Progress,
+    ) -> Result<()> {
+        let bytes = if size == 0 {
+            Bytes::new()
+        } else {
+            fetch_range_with_progress(download_client, url, 0, size - 1, progress).await?
+        };
+        let sha1 = sha1_hex_bytes(&bytes);
+        let encoded_name = percent_encode_filename(file_name);
+
+        let mut attempt = 0usize;
+        loop {
+            let upload = self.get_upload_url(bucket_id).await?;
+            let response = self
+                .client
+                .post(&upload.upload_url)
+                .header(AUTHORIZATION, upload.authorization_token)
+                .header("X-Bz-File-Name", encoded_name.clone())
+                .header("Content-Type", "b2/x-auto")
+                .header("X-Bz-Content-Sha1", sha1.clone())
+                .header(CONTENT_LENGTH, size.to_string())
+                .body(reqwest::Body::from(bytes.clone()))
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(resp) => resp,
+                Err(_) => {
+                    sleep_with_backoff(attempt).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+
+            if response.status().is_success() {
+                progress.add_upload(size);
+                break;
+            }
+
+            if response.status() == StatusCode::UNAUTHORIZED || should_retry_status(response.status()) {
+                self.refresh_authorization().await?;
+                sleep_with_backoff(attempt).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+
+            return Err(parse_b2_error(response).await);
+        }
+
+        Ok(())
+    }
+
     async fn compute_part_size(&self, size: u64) -> Result<(u64, u64)> {
         let state = self.state.lock().await.clone();
         let mut part_size = state
@@ -786,6 +851,11 @@ impl B2Client {
     async fn get_upload_part_url(&self, file_id: &str) -> Result<UploadPartUrlResponse> {
         let body = serde_json::json!({"fileId": file_id});
         self.post_json_with_reauth("b2_get_upload_part_url", body).await
+    }
+
+    async fn get_upload_url(&self, bucket_id: &str) -> Result<UploadUrlResponse> {
+        let body = serde_json::json!({"bucketId": bucket_id});
+        self.post_json_with_reauth("b2_get_upload_url", body).await
     }
 
     async fn finish_large_file(&self, file_id: &str, part_sha1s: Vec<String>) -> Result<()> {
@@ -946,6 +1016,15 @@ struct UploadPartUrlResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UploadUrlResponse {
+    upload_url: String,
+    authorization_token: String,
+    #[allow(dead_code)]
+    bucket_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartLargeFileResponse {
     file_id: String,
 }
@@ -985,6 +1064,23 @@ fn sha1_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn percent_encode_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }
 
 fn read_latest(path: &Path) -> Result<Option<u64>> {
