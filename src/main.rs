@@ -283,7 +283,6 @@ impl Progress {
         self.inner.uploaded.store(bytes, Ordering::Relaxed);
         self.inner.ui.download().set_position(bytes);
         self.inner.ui.upload().set_position(bytes);
-        self.inner.ui.overall().set_position(bytes);
         if let Some(epoch) = max_epoch {
             self.inner
                 .latest_downloaded_epoch
@@ -302,7 +301,6 @@ impl Progress {
     fn add_upload(&self, bytes: u64) {
         let new = self.inner.uploaded.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.inner.ui.upload().set_position(new);
-        self.inner.ui.overall().set_position(new);
     }
 
     fn mark_downloaded_epoch(&self, epoch: u64) {
@@ -358,7 +356,6 @@ impl Progress {
 
 struct ProgressUi {
     multi: MultiProgress,
-    overall: ProgressBar,
     download: ProgressBar,
     upload: ProgressBar,
 }
@@ -367,11 +364,6 @@ impl ProgressUi {
     fn new(total_bytes: u64) -> Self {
         let multi = MultiProgress::new();
         multi.set_draw_target(ProgressDrawTarget::stdout_with_hz(10));
-
-        let overall = multi.add(ProgressBar::new(total_bytes));
-        overall.set_style(progress_style());
-        overall.set_prefix("overall");
-        overall.enable_steady_tick(Duration::from_millis(100));
 
         let download = multi.add(ProgressBar::new(total_bytes));
         download.set_style(progress_style());
@@ -385,14 +377,9 @@ impl ProgressUi {
 
         Self {
             multi,
-            overall,
             download,
             upload,
         }
-    }
-
-    fn overall(&self) -> &ProgressBar {
-        &self.overall
     }
 
     fn download(&self) -> &ProgressBar {
@@ -403,8 +390,8 @@ impl ProgressUi {
         &self.upload
     }
 
-    fn set_overall_message(&self, message: String) {
-        self.overall.set_message(message);
+    fn set_status_message(&self, message: String) {
+        self.upload.set_message(message);
     }
 
     fn println(&self, message: impl AsRef<str>) {
@@ -1201,7 +1188,7 @@ fn log_progress(epoch: u64, progress: &Progress) {
         format_bytes(downloaded),
         format_bytes(uploaded),
     );
-    progress.ui().set_overall_message(message);
+    progress.ui().set_status_message(message);
 }
 
 fn format_bytes(bytes: u64) -> String {
