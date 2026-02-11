@@ -292,6 +292,7 @@ impl Progress {
         self.inner.uploaded.store(bytes, Ordering::Relaxed);
         self.inner.ui.download().set_position(bytes);
         self.inner.ui.upload().set_position(bytes);
+        self.inner.ui.reset_estimates();
         if let Some(epoch) = max_epoch {
             self.inner
                 .latest_downloaded_epoch
@@ -404,6 +405,11 @@ impl ProgressUi {
             .set_prefix(format!("download({}t)", num_threads));
         self.upload
             .set_prefix(format!("upload({}t)", num_threads));
+    }
+
+    fn reset_estimates(&self) {
+        self.download.reset_eta();
+        self.upload.reset_eta();
     }
 
     fn set_status_message(&self, message: String) {
