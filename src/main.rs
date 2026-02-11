@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
                         let guard = tracker.lock().await;
                         guard.completed_count()
                     };
-                    log_progress(epoch, &progress, completed_count);
+                    log_progress(epoch, &progress, completed_count, config.num_threads);
                     progress.ui().println(format!(
                         "Completed epoch {} ({} total).",
                         epoch, completed_count
@@ -1179,7 +1179,7 @@ fn sum_completed_bytes(sizes: &BTreeMap<u64, u64>, completed: &BTreeSet<u64>) ->
         .sum()
 }
 
-fn log_progress(epoch: u64, progress: &Progress, completed_count: usize) {
+fn log_progress(epoch: u64, progress: &Progress, completed_count: usize, num_threads: usize) {
     progress.mark_downloaded_epoch(epoch);
     progress.mark_uploaded_epoch(epoch);
 
@@ -1188,7 +1188,8 @@ fn log_progress(epoch: u64, progress: &Progress, completed_count: usize) {
     let tip_epoch = progress.tip_epoch();
     let remaining_epochs = progress.remaining_epochs();
     let message = format!(
-        "dl_epoch={} ul_epoch={} tip={} remaining_epochs={} completed={} dl={} ul={}",
+        "threads={} dl_epoch={} ul_epoch={} tip={} remaining_epochs={} completed={} dl={} ul={}",
+        num_threads,
         latest_downloaded
             .map(|val| val.to_string())
             .unwrap_or_else(|| "-".to_string()),
