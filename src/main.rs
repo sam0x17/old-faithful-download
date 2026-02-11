@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
     );
 
     let progress = Progress::new(start_epoch, tip_epoch, tip_scan.total_bytes);
+    progress.ui().set_thread_prefix(config.num_threads);
 
     let completed_bytes = sum_completed_bytes(&tip_scan.epoch_sizes, &completed_epochs);
     if completed_bytes > 0 {
@@ -396,6 +397,13 @@ impl ProgressUi {
 
     fn upload(&self) -> &ProgressBar {
         &self.upload
+    }
+
+    fn set_thread_prefix(&self, num_threads: usize) {
+        self.download
+            .set_prefix(format!("download({}t)", num_threads));
+        self.upload
+            .set_prefix(format!("upload({}t)", num_threads));
     }
 
     fn set_status_message(&self, message: String) {
