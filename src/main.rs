@@ -152,7 +152,15 @@ async fn main() -> Result<()> {
         if let Some(result) = join_set.join_next().await {
             match result.context("epoch task panicked")?? {
                 EpochOutcome::Completed(epoch) => {
-                    log_progress(epoch, &progress);
+                    let completed_count = {
+                        let guard = tracker.lock().await;
+                        guard.completed_count()
+                    };
+                    log_progress(epoch, &progress, completed_count);
+                    progress.ui().println(format!(
+                        "Completed epoch {} ({} total).",
+                        epoch, completed_count
+                    ));
                 }
                 EpochOutcome::NotFound { epoch, resource, url } => {
                     progress.ui().println(format!(
@@ -434,6 +442,10 @@ impl CompletionTracker {
         write_progress(&self.progress_path, &self.completed)?;
         self.advance_latest()?;
         Ok(())
+    }
+
+    fn completed_count(&self) -> usize {
+        self.completed.len()
     }
 
     fn advance_latest(&mut self) -> Result<()> {
@@ -1167,7 +1179,7 @@ fn sum_completed_bytes(sizes: &BTreeMap<u64, u64>, completed: &BTreeSet<u64>) ->
         .sum()
 }
 
-fn log_progress(epoch: u64, progress: &Progress) {
+fn log_progress(epoch: u64, progress: &Progress, completed_count: usize) {
     progress.mark_downloaded_epoch(epoch);
     progress.mark_uploaded_epoch(epoch);
 
@@ -1176,7 +1188,7 @@ fn log_progress(epoch: u64, progress: &Progress) {
     let tip_epoch = progress.tip_epoch();
     let remaining_epochs = progress.remaining_epochs();
     let message = format!(
-        "dl_epoch={} ul_epoch={} tip={} remaining_epochs={} dl={} ul={}",
+        "dl_epoch={} ul_epoch={} tip={} remaining_epochs={} completed={} dl={} ul={}",
         latest_downloaded
             .map(|val| val.to_string())
             .unwrap_or_else(|| "-".to_string()),
@@ -1185,6 +1197,7 @@ fn log_progress(epoch: u64, progress: &Progress) {
             .unwrap_or_else(|| "-".to_string()),
         tip_epoch,
         remaining_epochs,
+        completed_count,
         format_bytes(downloaded),
         format_bytes(uploaded),
     );
