@@ -378,12 +378,10 @@ impl ProgressUi {
         let download = multi.add(ProgressBar::new(total_bytes));
         download.set_style(progress_style());
         download.set_prefix("download");
-        download.enable_steady_tick(Duration::from_millis(100));
 
         let upload = multi.add(ProgressBar::new(total_bytes));
         upload.set_style(progress_style());
         upload.set_prefix("upload");
-        upload.enable_steady_tick(Duration::from_millis(100));
 
         Self {
             multi,
