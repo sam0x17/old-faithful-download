@@ -22,6 +22,8 @@ Required:
 Optional:
 - `NUM_THREADS` (default: 16)  
   Controls both concurrent downloads and uploads.
+- `CHECK_THREADS` (default: 16)  
+  Concurrency for `--check` mode.
 - `TIP_SCAN_THREADS` (default: 32)  
   Parallelism for tip scan HEAD requests.
 - `START_EPOCH` (default: 0)
@@ -36,6 +38,12 @@ export BACKBLAZE_APPLICATION_KEY=...
 export BACKBLAZE_BUCKET_NAME=...
 
 cargo run --release
+```
+
+## Check Mode
+Verify that each epoch’s files in Backblaze match the source file sizes:
+```bash
+cargo run --release -- --check
 ```
 
 ## Progress & Resume

@@ -22,6 +22,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 const DEFAULT_NUM_THREADS: usize = 16;
+const DEFAULT_CHECK_THREADS: usize = 16;
 const DEFAULT_TIP_SCAN_THREADS: usize = 32;
 const DEFAULT_BASE_URL: &str = "https://files.old-faithful.net";
 const B2_AUTHORIZE_URL: &str = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account";
@@ -32,7 +33,14 @@ const B2_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let check_mode = args.iter().any(|arg| arg == "--check");
+
     let config = Arc::new(Config::from_env()?);
+
+    if check_mode {
+        return run_check(config).await;
+    }
 
     let bin_dir = PathBuf::from("bin");
     tokio::fs::create_dir_all(&bin_dir).await?;
@@ -184,6 +192,7 @@ struct Config {
     index_base_url: String,
     network: String,
     num_threads: usize,
+    check_threads: usize,
     tip_scan_threads: usize,
     start_epoch: u64,
     bucket_name: Option<String>,
@@ -217,6 +226,17 @@ impl Config {
             return Err(anyhow!("NUM_THREADS must be greater than 0"));
         }
 
+        let check_threads = env::var("CHECK_THREADS")
+            .ok()
+            .map(|val| val.parse::<usize>())
+            .transpose()
+            .context("CHECK_THREADS must be a valid usize")?
+            .unwrap_or(DEFAULT_CHECK_THREADS);
+
+        if check_threads == 0 {
+            return Err(anyhow!("CHECK_THREADS must be greater than 0"));
+        }
+
         let tip_scan_threads = env::var("TIP_SCAN_THREADS")
             .ok()
             .map(|val| val.parse::<usize>())
@@ -248,6 +268,7 @@ impl Config {
             index_base_url,
             network,
             num_threads,
+            check_threads,
             tip_scan_threads,
             start_epoch,
             bucket_name,
@@ -478,6 +499,11 @@ enum EpochOutcome {
     },
 }
 
+struct CheckOutcome {
+    epoch: u64,
+    issues: Vec<String>,
+}
+
 async fn process_epoch(
     epoch: u64,
     config: Arc<Config>,
@@ -583,6 +609,182 @@ async fn process_epoch(
     }
 
     Ok(EpochOutcome::Completed(epoch))
+}
+
+async fn run_check(config: Arc<Config>) -> Result<()> {
+    println!(
+        "Running check mode with {} threads starting at epoch {}...",
+        config.check_threads, config.start_epoch
+    );
+
+    let tip_scan = scan_tip(
+        &config.base_url,
+        &config.index_base_url,
+        &config.network,
+        config.start_epoch,
+        config.tip_scan_threads,
+    )
+    .await?;
+    let tip_epoch = tip_scan.tip_epoch;
+    println!("Tip scan complete. tip_epoch={}", tip_epoch);
+
+    let b2 = Arc::new(B2Client::new(&config.key_id, &config.application_key).await?);
+    let (bucket_id, bucket_name) = b2
+        .resolve_bucket(config.bucket_name.as_deref())
+        .await?;
+    let bucket_id = Arc::new(bucket_id);
+
+    println!(
+        "Checking epochs {}..={} against bucket {}",
+        config.start_epoch,
+        tip_epoch,
+        bucket_name.clone().unwrap_or_else(|| bucket_id.as_ref().clone())
+    );
+
+    let download_client = Arc::new(reqwest::Client::new());
+    let mut join_set = JoinSet::new();
+    let mut next_epoch = config.start_epoch;
+    let mut checked = 0u64;
+    let mut mismatched = 0u64;
+
+    while next_epoch <= tip_epoch || !join_set.is_empty() {
+        while next_epoch <= tip_epoch && join_set.len() < config.check_threads {
+            let epoch = next_epoch;
+            next_epoch = next_epoch.saturating_add(1);
+
+            let config = Arc::clone(&config);
+            let b2 = Arc::clone(&b2);
+            let bucket_id = Arc::clone(&bucket_id);
+            let download_client = Arc::clone(&download_client);
+
+            join_set.spawn(async move {
+                check_epoch(
+                    epoch,
+                    config,
+                    download_client,
+                    b2,
+                    bucket_id,
+                )
+                .await
+            });
+        }
+
+        if let Some(result) = join_set.join_next().await {
+            let outcome = result.context("check task panicked")??;
+            checked = checked.saturating_add(1);
+            if outcome.issues.is_empty() {
+                println!("Epoch {} ok.", outcome.epoch);
+            } else {
+                mismatched = mismatched.saturating_add(1);
+                println!("Epoch {} mismatches:", outcome.epoch);
+                for issue in outcome.issues {
+                    println!("  - {}", issue);
+                }
+            }
+        }
+    }
+
+    println!(
+        "Check complete. epochs_checked={} mismatched={}",
+        checked, mismatched
+    );
+
+    if mismatched > 0 {
+        return Err(anyhow!("check failed with {} mismatched epochs", mismatched));
+    }
+    Ok(())
+}
+
+async fn check_epoch(
+    epoch: u64,
+    config: Arc<Config>,
+    download_client: Arc<reqwest::Client>,
+    b2: Arc<B2Client>,
+    bucket_id: Arc<String>,
+) -> Result<CheckOutcome> {
+    let mut issues = Vec::new();
+
+    let car_name = format!("epoch-{}.car", epoch);
+    let car_url = format!("{}/{}/{}", config.base_url, epoch, car_name);
+    let car_len = match head_length(&download_client, &car_url).await? {
+        Some(len) => len,
+        None => {
+            issues.push("source car missing".to_string());
+            return Ok(CheckOutcome { epoch, issues });
+        }
+    };
+
+    let root = match fetch_car_root_base32(&download_client, &car_url).await {
+        Ok(root) => root,
+        Err(err) => {
+            issues.push(format!("failed to read CAR header: {}", err));
+            return Ok(CheckOutcome { epoch, issues });
+        }
+    };
+
+    let slot_name = format!(
+        "epoch-{}-{}-{}-slot-to-cid.index",
+        epoch, root, config.network
+    );
+    let slot_url = format!("{}/{}/{}", config.index_base_url, epoch, slot_name);
+    let slot_len = match head_length(&download_client, &slot_url).await? {
+        Some(len) => len,
+        None => {
+            issues.push("source slot-to-cid index missing".to_string());
+            0
+        }
+    };
+
+    let cid_name = format!(
+        "epoch-{}-{}-{}-cid-to-offset-and-size.index",
+        epoch, root, config.network
+    );
+    let cid_url = format!("{}/{}/{}", config.index_base_url, epoch, cid_name);
+    let cid_len = match head_length(&download_client, &cid_url).await? {
+        Some(len) => len,
+        None => {
+            issues.push("source cid-to-offset-and-size index missing".to_string());
+            0
+        }
+    };
+
+    let prefix = format!("{}/", epoch);
+    let remote_files = b2.list_file_names(&bucket_id, &prefix).await?;
+    let mut remote_map: BTreeMap<String, u64> = BTreeMap::new();
+    for file in remote_files {
+        remote_map.insert(file.file_name, file.content_length);
+    }
+
+    check_size(&mut issues, &remote_map, &format!("{}/{}", epoch, car_name), car_len);
+    check_size(
+        &mut issues,
+        &remote_map,
+        &format!("{}/{}", epoch, slot_name),
+        slot_len,
+    );
+    check_size(
+        &mut issues,
+        &remote_map,
+        &format!("{}/{}", epoch, cid_name),
+        cid_len,
+    );
+
+    Ok(CheckOutcome { epoch, issues })
+}
+
+fn check_size(issues: &mut Vec<String>, remote: &BTreeMap<String, u64>, name: &str, expected: u64) {
+    match remote.get(name) {
+        Some(size) if *size == expected => {}
+        Some(size) => {
+            issues.push(format!(
+                "{} size mismatch (b2={}, source={})",
+                name, size, expected
+            ));
+        }
+        None => {
+            issues.push(format!("{} missing in b2", name));
+        }
+    }
 }
 
 enum TransferOutcome {
@@ -692,6 +894,36 @@ impl B2Client {
         };
         let response: ListBucketsResponse = self.post_json_with_reauth("b2_list_buckets", body).await?;
         Ok(response.buckets)
+    }
+
+    async fn list_file_names(&self, bucket_id: &str, prefix: &str) -> Result<Vec<ListedFile>> {
+        let mut all = Vec::new();
+        let mut next_name: Option<String> = None;
+        loop {
+            let body = match &next_name {
+                Some(name) => serde_json::json!({
+                    "bucketId": bucket_id,
+                    "startFileName": name,
+                    "prefix": prefix,
+                    "maxFileCount": 1000
+                }),
+                None => serde_json::json!({
+                    "bucketId": bucket_id,
+                    "prefix": prefix,
+                    "maxFileCount": 1000
+                }),
+            };
+            let response: ListFileNamesResponse =
+                self.post_json_with_reauth("b2_list_file_names", body).await?;
+            all.extend(response.files);
+            match response.next_file_name {
+                Some(next) => {
+                    next_name = Some(next);
+                }
+                None => break,
+            }
+        }
+        Ok(all)
     }
 
     async fn upload_large_remote(
@@ -1024,6 +1256,20 @@ struct AllowedBucket {
 #[serde(rename_all = "camelCase")]
 struct ListBucketsResponse {
     buckets: Vec<Bucket>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListFileNamesResponse {
+    files: Vec<ListedFile>,
+    next_file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedFile {
+    file_name: String,
+    content_length: u64,
 }
 
 #[derive(Debug, Deserialize)]
